@@ -1,0 +1,8 @@
+[Unit]
+Description=Shut down node when network is idle and no media is playing
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/netwatch-shutdown
+SyslogIdentifier=netwatch-shutdown

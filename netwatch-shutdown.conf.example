@@ -1,0 +1,53 @@
+# /etc/netwatch-shutdown.conf
+# Config for /usr/local/sbin/netwatch-shutdown
+# Changes take effect on the next check, EXCEPT CHECK_INTERVAL_MIN,
+# which needs:  netwatch-shutdown --install
+# Logs:         journalctl -t netwatch-shutdown
+# Live view:    netwatch-shutdown --status
+
+# ---------------------------------------------------------------- Network ---
+# Interfaces to measure (space-separated). nic0 = the physical Ethernet port,
+# which carries all host + container internet/LAN traffic.
+INTERFACES="nic0"
+
+# How often to check, in minutes (re-run --install after changing).
+CHECK_INTERVAL_MIN=15
+
+# Thresholds are the AVERAGE rate over the whole interval, in KB/s.
+# If ANY non-zero threshold is exceeded, the node is "busy" and stays on.
+# 0 = ignore that threshold.
+RX_THRESHOLD_KBPS=0          # download
+TX_THRESHOLD_KBPS=0          # upload
+TOTAL_THRESHOLD_KBPS=500     # download + upload combined
+
+# Number of quiet intervals in a row before shutting down
+# (2 x 15 min = idle for 30 min).
+CONSECUTIVE_LOW_CHECKS=2
+
+# ----------------------------------------------------------- Media servers ---
+# An active Plex/Jellyfin stream ALWAYS keeps the node on, regardless of traffic.
+PLEX_ENABLED=1
+PLEX_URL="http://10.10.10.9:32400"       # CT 107 (static IP on vmbr1)
+PLEX_TOKEN=""                             # Plex Web -> any item -> Get Info -> View XML -> X-Plex-Token in URL
+
+JELLYFIN_ENABLED=1
+JELLYFIN_URL="http://10.10.10.18:8096"   # CT 112 (static IP on vmbr1)
+JELLYFIN_API_KEY=""                       # Jellyfin Dashboard -> API Keys -> +
+
+COUNT_PAUSED_AS_ACTIVE=1     # 1 = a paused stream still blocks shutdown
+MEDIA_CHECK_FAIL_SAFE=1      # 1 = if a server can't be queried, DON'T shut down
+MEDIA_TIMEOUT_SEC=5
+
+# ---------------------------------------------------------- Safety guards ---
+BOOT_GRACE_MIN=30            # never shut down within N minutes of boot
+SHUTDOWN_WINDOW=""           # only shut down inside this window, e.g. "23:00-07:00"
+                             # (overnight ranges OK). Empty = any time.
+SKIP_IF_USERS_LOGGED_IN=1    # 1 = don't shut down while someone is logged in (SSH/console)
+PAUSE_FILE="/etc/netwatch-shutdown.pause"   # touch this file to pause auto-shutdown
+
+# ----------------------------------------------------------------- Action ---
+DRY_RUN=1                    # 1 = only log what would happen. Set 0 to arm.
+SHUTDOWN_CMD="systemctl poweroff"
+
+# ------------------------------------------------------------------ Misc ----
+STATE_DIR="/run/netwatch-shutdown"   # tmpfs: resets on reboot

@@ -1,0 +1,3 @@
+# real config holds secrets
+*.conf
+!*.conf.example

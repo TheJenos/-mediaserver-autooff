@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# netwatch-shutdown — power off the node when the network is idle and nobody
+# is watching Plex/Jellyfin. Config: /etc/netwatch-shutdown.conf
+#
+# Usage:
+#   netwatch-shutdown            run one check (what the systemd timer does)
+#   netwatch-shutdown --status   show current rates / media / streak, take no action
+#   netwatch-shutdown --install  (re)create + enable the systemd timer from config
+#   netwatch-shutdown --uninstall
+set -uo pipefail
+
+CONF="${NETWATCH_CONF:-/etc/netwatch-shutdown.conf}"
+NAME="netwatch-shutdown"
+UNIT_DIR="/etc/systemd/system"
+
+# ---- defaults (overridden by config) ---------------------------------------
+INTERFACES="nic0"
+CHECK_INTERVAL_MIN=15
+RX_THRESHOLD_KBPS=0
+TX_THRESHOLD_KBPS=0
+TOTAL_THRESHOLD_KBPS=500
+CONSECUTIVE_LOW_CHECKS=2
+PLEX_ENABLED=0;     PLEX_URL="";     PLEX_TOKEN=""
+JELLYFIN_ENABLED=0; JELLYFIN_URL=""; JELLYFIN_API_KEY=""
+COUNT_PAUSED_AS_ACTIVE=1
+MEDIA_CHECK_FAIL_SAFE=1
+MEDIA_TIMEOUT_SEC=5
+BOOT_GRACE_MIN=30
+SHUTDOWN_WINDOW=""
+SKIP_IF_USERS_LOGGED_IN=1
+PAUSE_FILE="/etc/netwatch-shutdown.pause"
+DRY_RUN=1
+SHUTDOWN_CMD="systemctl poweroff"
+STATE_DIR="/run/netwatch-shutdown"
+
+if [[ -r "$CONF" ]]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
+else
+    echo "WARN: config $CONF not found, using built-in defaults" >&2
+fi
+STATE_FILE="$STATE_DIR/state"
+
+log() { echo "$*"; }   # stdout -> journal via SyslogIdentifier when run by systemd
+
+# ---- network counters -------------------------------------------------------
+# Prints "<rx_bytes> <tx_bytes>" summed over $INTERFACES.
+read_counters() {
+    local rx=0 tx=0 iface line found
+    for iface in $INTERFACES; do
+        found=0
+        while read -r line; do
+            line="${line//:/ }"
+            set -- $line
+            if [[ "$1" == "$iface" ]]; then
+                rx=$(( rx + $2 )); tx=$(( tx + ${10} )); found=1; break
+            fi
+        done < <(tail -n +3 /proc/net/dev)
+        if (( ! found )); then
+            log "ERROR: interface '$iface' not found in /proc/net/dev"
+            return 1
+        fi
+    done
+    echo "$rx $tx"
+}
+
+# KB/s with one decimal, from byte delta and seconds.
+kbps() { awk -v b="$1" -v s="$2" 'BEGIN{ if (s<=0) s=1; printf "%.1f", b/1024/s }'; }
+# Returns 0 if $1 > $2 (float); threshold 0 means "disabled" -> never exceeds.
+exceeds() { awk -v v="$1" -v t="$2" 'BEGIN{ exit !(t>0 && v>t) }'; }
+
+# ---- media sessions ---------------------------------------------------------
+# Sets MEDIA_ACTIVE (count), MEDIA_DESC, MEDIA_ERRORS.
+check_media() {
+    MEDIA_ACTIVE=0; MEDIA_DESC=""; MEDIA_ERRORS=""
+    local out n d
+
+    if [[ "$PLEX_ENABLED" == 1 ]]; then
+        if [[ -z "$PLEX_TOKEN" ]]; then
+            MEDIA_ERRORS+="plex: no token; "
+        elif out=$(curl -fsS -m "$MEDIA_TIMEOUT_SEC" -H "Accept: application/xml" \
+                       -H "X-Plex-Token: $PLEX_TOKEN" "$PLEX_URL/status/sessions" 2>&1) \
+             && out=$(printf '%s' "$out" | COUNT_PAUSED="$COUNT_PAUSED_AS_ACTIVE" python3 -I -c '
+import os, sys, xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read())
+paused_ok = os.environ.get("COUNT_PAUSED") == "1"
+items = []
+for el in root:
+    p = el.find("Player")
+    state = p.get("state", "playing") if p is not None else "playing"
+    if state == "paused" and not paused_ok:
+        continue
+    u = el.find("User")
+    user = u.get("title", "?") if u is not None else "?"
+    title = el.get("title", "?")
+    if el.get("grandparentTitle"):
+        title = el.get("grandparentTitle") + " - " + title
+    items.append(f"{user}: {title} [{state}]")
+print(len(items)); print("; ".join(items))
+' 2>&1); then
+            n=$(sed -n 1p <<<"$out"); d=$(sed -n 2p <<<"$out")
+            MEDIA_ACTIVE=$(( MEDIA_ACTIVE + n ))
+            MEDIA_DESC+="Plex: $n${d:+ ($d)}; "
+        else
+            MEDIA_ERRORS+="plex: $(head -c 200 <<<"$out" | tr '\n' ' '); "
+        fi
+    fi
+
+    if [[ "$JELLYFIN_ENABLED" == 1 ]]; then
+        if [[ -z "$JELLYFIN_API_KEY" ]]; then
+            MEDIA_ERRORS+="jellyfin: no api key; "
+        elif out=$(curl -fsS -m "$MEDIA_TIMEOUT_SEC" \
+                       -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" \
+                       "$JELLYFIN_URL/Sessions?activeWithinSeconds=960" 2>&1) \
+             && out=$(printf '%s' "$out" | COUNT_PAUSED="$COUNT_PAUSED_AS_ACTIVE" python3 -I -c '
+import os, sys, json
+paused_ok = os.environ.get("COUNT_PAUSED") == "1"
+items = []
+for s in json.load(sys.stdin):
+    np = s.get("NowPlayingItem")
+    if not np:
+        continue
+    paused = (s.get("PlayState") or {}).get("IsPaused", False)
+    if paused and not paused_ok:
+        continue
+    title = np.get("Name", "?")
+    if np.get("SeriesName"):
+        title = np["SeriesName"] + " - " + title
+    user = s.get("UserName", "?")
+    state = "paused" if paused else "playing"
+    items.append(f"{user}: {title} [{state}]")
+print(len(items)); print("; ".join(items))
+' 2>&1); then
+            n=$(sed -n 1p <<<"$out"); d=$(sed -n 2p <<<"$out")
+            MEDIA_ACTIVE=$(( MEDIA_ACTIVE + n ))
+            MEDIA_DESC+="Jellyfin: $n${d:+ ($d)}; "
+        else
+            MEDIA_ERRORS+="jellyfin: $(head -c 200 <<<"$out" | tr '\n' ' '); "
+        fi
+    fi
+}
+
+# ---- guards -----------------------------------------------------------------
+uptime_min() { awk '{printf "%d", $1/60}' /proc/uptime; }
+
+in_window() {   # 0 if now is inside SHUTDOWN_WINDOW (or no window set)
+    [[ -z "$SHUTDOWN_WINDOW" ]] && return 0
+    local s e now
+    s=$(date -d "${SHUTDOWN_WINDOW%-*}" +%H%M 2>/dev/null) || { log "WARN: bad SHUTDOWN_WINDOW '$SHUTDOWN_WINDOW'"; return 1; }
+    e=$(date -d "${SHUTDOWN_WINDOW#*-}" +%H%M 2>/dev/null) || { log "WARN: bad SHUTDOWN_WINDOW '$SHUTDOWN_WINDOW'"; return 1; }
+    now=$(date +%H%M)
+    if ((10#$s <= 10#$e)); then ((10#$now >= 10#$s && 10#$now < 10#$e))
+    else ((10#$now >= 10#$s || 10#$now < 10#$e)); fi   # overnight
+}
+
+logged_in_users() { who | awk '{print $1}' | sort -u | paste -sd, -; }
+
+# ---- state ------------------------------------------------------------------
+load_state() {
+    PREV_TS=""; PREV_RX=""; PREV_TX=""; STREAK=0
+    [[ -r "$STATE_FILE" ]] && read -r PREV_TS PREV_RX PREV_TX STREAK < "$STATE_FILE"
+    STREAK=${STREAK:-0}
+}
+save_state() {   # ts rx tx streak
+    mkdir -p "$STATE_DIR"
+    echo "$1 $2 $3 $4" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# ---- main check -------------------------------------------------------------
+run_check() {
+    local now cnt rx tx elapsed rxk txk totk busy=""
+    now=$(date +%s)
+    cnt=$(read_counters) || exit 1
+    read -r rx tx <<<"$cnt"
+    load_state
+
+    if [[ -z "$PREV_TS" ]]; then
+        save_state "$now" "$rx" "$tx" 0
+        log "baseline recorded (first run since boot); next check computes rates"
+        return 0
+    fi
+    if (( rx < PREV_RX || tx < PREV_TX )); then
+        save_state "$now" "$rx" "$tx" 0
+        log "counter reset detected; baseline re-recorded"
+        return 0
+    fi
+
+    elapsed=$(( now - PREV_TS ))
+    rxk=$(kbps $(( rx - PREV_RX )) "$elapsed")
+    txk=$(kbps $(( tx - PREV_TX )) "$elapsed")
+    totk=$(kbps $(( rx - PREV_RX + tx - PREV_TX )) "$elapsed")
+    local net="avg over ${elapsed}s on [$INTERFACES]: down ${rxk} KB/s, up ${txk} KB/s, total ${totk} KB/s"
+
+    exceeds "$rxk"  "$RX_THRESHOLD_KBPS"    && busy+="down>${RX_THRESHOLD_KBPS} "
+    exceeds "$txk"  "$TX_THRESHOLD_KBPS"    && busy+="up>${TX_THRESHOLD_KBPS} "
+    exceeds "$totk" "$TOTAL_THRESHOLD_KBPS" && busy+="total>${TOTAL_THRESHOLD_KBPS} "
+
+    check_media
+    local media="${MEDIA_DESC:-media: off}${MEDIA_ERRORS:+ ERR: $MEDIA_ERRORS}"
+
+    # 1) someone watching -> keep running
+    if (( MEDIA_ACTIVE > 0 )); then
+        save_state "$now" "$rx" "$tx" 0
+        log "KEEP: media active | $media| $net"; return 0
+    fi
+    # 2) network busy -> keep running
+    if [[ -n "$busy" ]]; then
+        save_state "$now" "$rx" "$tx" 0
+        log "KEEP: network busy (${busy% }) | $net | $media"; return 0
+    fi
+    # 3) media status unknown -> fail safe (streak unchanged)
+    if [[ -n "$MEDIA_ERRORS" && "$MEDIA_CHECK_FAIL_SAFE" == 1 ]]; then
+        save_state "$now" "$rx" "$tx" "$STREAK"
+        log "SKIP: media servers could not be checked (fail-safe) | $media| $net"; return 0
+    fi
+
+    STREAK=$(( STREAK + 1 ))
+    save_state "$now" "$rx" "$tx" "$STREAK"
+    if (( STREAK < CONSECUTIVE_LOW_CHECKS )); then
+        log "IDLE ${STREAK}/${CONSECUTIVE_LOW_CHECKS} | $net | $media"; return 0
+    fi
+
+    # idle long enough — check guards
+    local up users
+    if [[ -n "$PAUSE_FILE" && -e "$PAUSE_FILE" ]]; then
+        log "SKIP: idle ${STREAK}/${CONSECUTIVE_LOW_CHECKS} but paused ($PAUSE_FILE exists) | $net"; return 0
+    fi
+    up=$(uptime_min)
+    if (( up < BOOT_GRACE_MIN )); then
+        log "SKIP: idle but within boot grace (${up}/${BOOT_GRACE_MIN} min) | $net"; return 0
+    fi
+    if ! in_window; then
+        log "SKIP: idle but outside shutdown window ($SHUTDOWN_WINDOW) | $net"; return 0
+    fi
+    users=$(logged_in_users)
+    if [[ "$SKIP_IF_USERS_LOGGED_IN" == 1 && -n "$users" ]]; then
+        log "SKIP: idle but users logged in ($users) | $net"; return 0
+    fi
+
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "WOULD SHUT DOWN (DRY_RUN=1): idle ${STREAK}/${CONSECUTIVE_LOW_CHECKS} | $net | $media"; return 0
+    fi
+    log "SHUTTING DOWN: idle ${STREAK}/${CONSECUTIVE_LOW_CHECKS} | $net | $media"
+    logger -p user.warning -t "$NAME" "shutting down: network idle, no media sessions"
+    rm -f "$STATE_FILE"
+    $SHUTDOWN_CMD
+}
+
+# ---- status (read-only) -----------------------------------------------------
+show_status() {
+    local now cnt rx tx elapsed
+    now=$(date +%s); cnt=$(read_counters) || exit 1; read -r rx tx <<<"$cnt"
+    load_state
+    if [[ -n "$PREV_TS" ]] && (( rx >= PREV_RX && tx >= PREV_TX && now > PREV_TS )); then
+        elapsed=$(( now - PREV_TS ))
+        echo "Network since last check (${elapsed}s ago) on [$INTERFACES]:"
+    else
+        echo "No previous check yet — sampling 5s on [$INTERFACES]:"
+        PREV_RX=$rx; PREV_TX=$tx; sleep 5
+        read -r rx tx <<<"$(read_counters)"; elapsed=5
+    fi
+    printf '  down  %8s KB/s   (threshold %s)\n' "$(kbps $((rx-PREV_RX)) $elapsed)" "$RX_THRESHOLD_KBPS"
+    printf '  up    %8s KB/s   (threshold %s)\n' "$(kbps $((tx-PREV_TX)) $elapsed)" "$TX_THRESHOLD_KBPS"
+    printf '  total %8s KB/s   (threshold %s)   [0 = disabled]\n' "$(kbps $((rx-PREV_RX+tx-PREV_TX)) $elapsed)" "$TOTAL_THRESHOLD_KBPS"
+    check_media
+    echo "Media:    ${MEDIA_DESC:-disabled}"
+    [[ -n "$MEDIA_ERRORS" ]] && echo "Media ERR: $MEDIA_ERRORS"
+    echo "Idle streak: ${STREAK}/${CONSECUTIVE_LOW_CHECKS}   uptime: $(uptime_min) min (grace ${BOOT_GRACE_MIN})"
+    echo "Window: ${SHUTDOWN_WINDOW:-any time}   in window: $(in_window && echo yes || echo no)"
+    echo "Logged in: $(logged_in_users)   (block=${SKIP_IF_USERS_LOGGED_IN})"
+    echo "Paused: $([[ -e $PAUSE_FILE ]] && echo "yes ($PAUSE_FILE)" || echo no)   DRY_RUN=$DRY_RUN"
+    systemctl list-timers "$NAME.timer" --no-pager 2>/dev/null | sed -n 1,2p
+}
+
+# ---- install / uninstall ----------------------------------------------------
+do_install() {
+    cat > "$UNIT_DIR/$NAME.service" <<EOF
+[Unit]
+Description=Shut down node when network is idle and no media is playing
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/$NAME
+SyslogIdentifier=$NAME
+EOF
+    cat > "$UNIT_DIR/$NAME.timer" <<EOF
+[Unit]
+Description=Run $NAME every ${CHECK_INTERVAL_MIN} min
+
+[Timer]
+OnBootSec=${CHECK_INTERVAL_MIN}min
+OnUnitActiveSec=${CHECK_INTERVAL_MIN}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$NAME.timer"
+    systemctl restart "$NAME.timer"
+    echo "Installed. Interval: ${CHECK_INTERVAL_MIN} min. DRY_RUN=$DRY_RUN"
+    systemctl list-timers "$NAME.timer" --no-pager | sed -n 1,2p
+}
+
+do_uninstall() {
+    systemctl disable --now "$NAME.timer" 2>/dev/null
+    rm -f "$UNIT_DIR/$NAME.service" "$UNIT_DIR/$NAME.timer"
+    systemctl daemon-reload
+    rm -rf "$STATE_DIR"
+    echo "Uninstalled timer/service. Config ($CONF) and script left in place."
+}
+
+case "${1:-}" in
+    "")            run_check ;;
+    --status)      show_status ;;
+    --install)     do_install ;;
+    --uninstall)   do_uninstall ;;
+    -h|--help)     sed -n 2,9p "$0" ;;
+    *)             echo "unknown option: $1" >&2; exit 2 ;;
+esac
