@@ -11,7 +11,9 @@ Every 15 minutes (configurable) it checks:
 5. **Idle for N checks in a row?** → shut down, unless a guard applies:
    boot grace period, pause file, outside the shutdown time window, or a user logged in.
 
-Pure bash + systemd timer. Needs `curl` and `python3` (for parsing Plex XML / Jellyfin JSON). All decisions are logged to the journal.
+Every check is written as one timestamped line to `/var/log/netwatch-shutdown.log` (lines older than 24 h are pruned automatically) and to the journal. Each `KEEP` line names **every** reason the node stayed on.
+
+Pure bash + systemd timer. Needs `curl` and `python3` (for parsing Plex XML / Jellyfin + qBittorrent JSON). All decisions are logged to the journal.
 
 ## Install
 
@@ -27,7 +29,8 @@ It starts in **dry-run mode** (`DRY_RUN=1`): it only logs what it would do. Watc
 ## Usage
 
 ```bash
-netwatch-shutdown --status              # live traffic, who's watching, guard status
+netwatch-shutdown --status              # what's keeping it awake right now + last 5 checks
+netwatch-shutdown --log                 # every check from the last 24 h
 journalctl -t netwatch-shutdown -f      # follow decisions
 touch /etc/netwatch-shutdown.pause      # pause auto-shutdown (rm to resume)
 netwatch-shutdown --install             # re-run after changing CHECK_INTERVAL_MIN
@@ -58,6 +61,8 @@ See [`netwatch-shutdown.conf.example`](netwatch-shutdown.conf.example). Every op
 | `SHUTDOWN_WINDOW` | empty | e.g. `23:00-07:00`; empty = any time |
 | `SKIP_IF_USERS_LOGGED_IN` | `1` | Don't shut down while someone is logged in |
 | `DRY_RUN` | `1` | Log only; set `0` to arm |
+| `LOG_FILE` | `/var/log/netwatch-shutdown.log` | Per-check log; empty = journal only |
+| `LOG_RETENTION_HOURS` | `24` | Prune older log lines; `0` = keep all |
 
 The real config contains secrets: keep it `chmod 600` and never commit it (`.gitignore` excludes `*.conf`).
 

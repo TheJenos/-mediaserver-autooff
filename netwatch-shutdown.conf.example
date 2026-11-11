@@ -62,3 +62,9 @@ SHUTDOWN_CMD="systemctl poweroff"
 
 # ------------------------------------------------------------------ Misc ----
 STATE_DIR="/run/netwatch-shutdown"   # tmpfs: resets on reboot
+
+# ------------------------------------------------------------------- Log ----
+# One timestamped line per check (also in: journalctl -t netwatch-shutdown).
+# View with: netwatch-shutdown --log
+LOG_FILE="/var/log/netwatch-shutdown.log"   # empty = journal only
+LOG_RETENTION_HOURS=24                       # older lines are deleted on each check; 0 = keep all
