@@ -38,6 +38,17 @@ COUNT_PAUSED_AS_ACTIVE=1     # 1 = a paused stream still blocks shutdown
 MEDIA_CHECK_FAIL_SAFE=1      # 1 = if a server can't be queried, DON'T shut down
 MEDIA_TIMEOUT_SEC=5
 
+# ------------------------------------------------------------ qBittorrent ---
+# A torrent that is actively downloading keeps the node on.
+# Stalled (stalledDL), seeding, paused, queued and metadata-fetching torrents don't count.
+QBIT_ENABLED=1
+QBIT_URL="http://10.10.10.4:8090"        # CT 102 (static IP on vmbr1)
+QBIT_USERNAME="admin"
+QBIT_PASSWORD=""                         # WebUI password. Leave empty only if the WebUI
+                                         # bypasses auth for this host (10.10.10.1).
+QBIT_ACTIVE_STATES="downloading forcedDL"  # qBittorrent states that count as "downloading"
+QBIT_FAIL_SAFE=1                         # 1 = if qBittorrent can't be queried, DON'T shut down
+
 # ---------------------------------------------------------- Safety guards ---
 BOOT_GRACE_MIN=30            # never shut down within N minutes of boot
 SHUTDOWN_WINDOW=""           # only shut down inside this window, e.g. "23:00-07:00"

@@ -5,9 +5,10 @@ Automatically powers off a home media server (built for a Proxmox host) when it'
 Every 15 minutes (configurable) it checks:
 
 1. **Is anyone watching Plex or Jellyfin?** → stay on (paused streams count too, configurable).
-2. **Is the network busy?** Average download/upload over the whole interval vs. thresholds → stay on.
-3. **Can't reach Plex/Jellyfin?** → stay on (fail-safe).
-4. **Idle for N checks in a row?** → shut down, unless a guard applies:
+2. **Is qBittorrent actively downloading?** (state `downloading`/`forcedDL`; stalled, seeding, paused and stopped torrents don't count) → stay on.
+3. **Is the network busy?** Average download/upload over the whole interval vs. thresholds → stay on.
+4. **Can't reach Plex/Jellyfin/qBittorrent?** → stay on (fail-safe).
+5. **Idle for N checks in a row?** → shut down, unless a guard applies:
    boot grace period, pause file, outside the shutdown time window, or a user logged in.
 
 Pure bash + systemd timer. Needs `curl` and `python3` (for parsing Plex XML / Jellyfin JSON). All decisions are logged to the journal.
@@ -17,7 +18,7 @@ Pure bash + systemd timer. Needs `curl` and `python3` (for parsing Plex XML / Je
 ```bash
 install -m 755 netwatch-shutdown /usr/local/sbin/netwatch-shutdown
 install -m 600 netwatch-shutdown.conf.example /etc/netwatch-shutdown.conf
-nano /etc/netwatch-shutdown.conf        # set interfaces, thresholds, Plex token, Jellyfin API key
+nano /etc/netwatch-shutdown.conf        # set interfaces, thresholds, Plex token, Jellyfin API key, qBittorrent login
 netwatch-shutdown --install             # creates + enables the systemd timer
 ```
 
@@ -52,6 +53,7 @@ See [`netwatch-shutdown.conf.example`](netwatch-shutdown.conf.example). Every op
 | `RX/TX/TOTAL_THRESHOLD_KBPS` | `0/0/500` | Avg KB/s that counts as "busy"; `0` disables |
 | `CONSECUTIVE_LOW_CHECKS` | `2` | Idle intervals in a row before shutdown |
 | `PLEX_*`, `JELLYFIN_*` | | Media server URL + token/API key |
+| `QBIT_*` | | qBittorrent WebUI URL, username, password, which states count as downloading |
 | `BOOT_GRACE_MIN` | `30` | Never shut down soon after boot |
 | `SHUTDOWN_WINDOW` | empty | e.g. `23:00-07:00`; empty = any time |
 | `SKIP_IF_USERS_LOGGED_IN` | `1` | Don't shut down while someone is logged in |

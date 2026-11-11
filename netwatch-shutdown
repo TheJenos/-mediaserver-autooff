@@ -25,6 +25,9 @@ JELLYFIN_ENABLED=0; JELLYFIN_URL=""; JELLYFIN_API_KEY=""
 COUNT_PAUSED_AS_ACTIVE=1
 MEDIA_CHECK_FAIL_SAFE=1
 MEDIA_TIMEOUT_SEC=5
+QBIT_ENABLED=0; QBIT_URL=""; QBIT_USERNAME=""; QBIT_PASSWORD=""
+QBIT_ACTIVE_STATES="downloading forcedDL"
+QBIT_FAIL_SAFE=1
 BOOT_GRACE_MIN=30
 SHUTDOWN_WINDOW=""
 SKIP_IF_USERS_LOGGED_IN=1
@@ -140,6 +143,44 @@ print(len(items)); print("; ".join(items))
     fi
 }
 
+# ---- qBittorrent downloads --------------------------------------------------
+# Sets QBIT_ACTIVE (count of torrents in QBIT_ACTIVE_STATES), QBIT_DESC, QBIT_ERR.
+check_qbit() {
+    QBIT_ACTIVE=0; QBIT_DESC=""; QBIT_ERR=""
+    [[ "$QBIT_ENABLED" == 1 ]] || return 0
+    local jar out n d
+    jar=$(mktemp)
+    if [[ -n "$QBIT_PASSWORD" ]]; then
+        # qBittorrent <5 answers 200 "Ok."; 5.x answers 204 with an empty body.
+        out=$(curl -sS -m "$MEDIA_TIMEOUT_SEC" -c "$jar" --referer "$QBIT_URL" \
+                -w '|%{http_code}' \
+                --data-urlencode "username=$QBIT_USERNAME" \
+                --data-urlencode "password=$QBIT_PASSWORD" \
+                "$QBIT_URL/api/v2/auth/login" 2>&1)
+        if [[ "$out" != "Ok.|200" && "$out" != "|204" ]]; then
+            QBIT_ERR="qbittorrent: login failed ($(head -c 100 <<<"$out" | tr '\n' ' '))"
+            rm -f "$jar"; return 0
+        fi
+    fi
+    if out=$(curl -fsS -m "$MEDIA_TIMEOUT_SEC" -b "$jar" "$QBIT_URL/api/v2/torrents/info" 2>&1) \
+       && out=$(printf '%s' "$out" | STATES="$QBIT_ACTIVE_STATES" python3 -I -c '
+import os, sys, json
+states = set(os.environ["STATES"].split())
+act = [t for t in json.load(sys.stdin) if t.get("state") in states]
+desc = ["%s %.0f%% %.0fKB/s" % (t.get("name", "?")[:40], t.get("progress", 0) * 100,
+                                 t.get("dlspeed", 0) / 1024) for t in act[:3]]
+if len(act) > 3: desc.append(f"+{len(act)-3} more")
+print(len(act)); print("; ".join(desc))
+' 2>&1); then
+        n=$(sed -n 1p <<<"$out"); d=$(sed -n 2p <<<"$out")
+        QBIT_ACTIVE=$n
+        QBIT_DESC="qBittorrent: $n downloading${d:+ ($d)}"
+    else
+        QBIT_ERR="qbittorrent: $(head -c 150 <<<"$out" | tr '\n' ' ')"
+    fi
+    rm -f "$jar"
+}
+
 # ---- guards -----------------------------------------------------------------
 uptime_min() { awk '{printf "%d", $1/60}' /proc/uptime; }
 
@@ -203,15 +244,25 @@ run_check() {
         save_state "$now" "$rx" "$tx" 0
         log "KEEP: media active | $media| $net"; return 0
     fi
-    # 2) network busy -> keep running
+    # 2) torrents actively downloading -> keep running
+    check_qbit
+    if (( QBIT_ACTIVE > 0 )); then
+        save_state "$now" "$rx" "$tx" 0
+        log "KEEP: $QBIT_DESC | $net | $media"; return 0
+    fi
+    # 3) network busy -> keep running
     if [[ -n "$busy" ]]; then
         save_state "$now" "$rx" "$tx" 0
         log "KEEP: network busy (${busy% }) | $net | $media"; return 0
     fi
-    # 3) media status unknown -> fail safe (streak unchanged)
+    # 4) media / torrent status unknown -> fail safe (streak unchanged)
     if [[ -n "$MEDIA_ERRORS" && "$MEDIA_CHECK_FAIL_SAFE" == 1 ]]; then
         save_state "$now" "$rx" "$tx" "$STREAK"
         log "SKIP: media servers could not be checked (fail-safe) | $media| $net"; return 0
+    fi
+    if [[ -n "$QBIT_ERR" && "$QBIT_FAIL_SAFE" == 1 ]]; then
+        save_state "$now" "$rx" "$tx" "$STREAK"
+        log "SKIP: qBittorrent could not be checked (fail-safe) | $QBIT_ERR | $net"; return 0
     fi
 
     STREAK=$(( STREAK + 1 ))
@@ -265,6 +316,13 @@ show_status() {
     check_media
     echo "Media:    ${MEDIA_DESC:-disabled}"
     [[ -n "$MEDIA_ERRORS" ]] && echo "Media ERR: $MEDIA_ERRORS"
+    check_qbit
+    if [[ "$QBIT_ENABLED" == 1 ]]; then
+        echo "Torrents: ${QBIT_DESC:-?}  (counts states: $QBIT_ACTIVE_STATES)"
+        [[ -n "$QBIT_ERR" ]] && echo "Torrent ERR: $QBIT_ERR"
+    else
+        echo "Torrents: disabled"
+    fi
     echo "Idle streak: ${STREAK}/${CONSECUTIVE_LOW_CHECKS}   uptime: $(uptime_min) min (grace ${BOOT_GRACE_MIN})"
     echo "Window: ${SHUTDOWN_WINDOW:-any time}   in window: $(in_window && echo yes || echo no)"
     echo "Logged in: $(logged_in_users)   (block=${SKIP_IF_USERS_LOGGED_IN})"
